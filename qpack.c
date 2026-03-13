@@ -18,6 +18,7 @@
 #include "php_ini.h"
 #include "ext/standard/info.h"
 #include "zend_exceptions.h"
+#include "ext/spl/spl_exceptions.h"
 #include "php_qpack.h"
 
 #include <string.h>
@@ -766,18 +767,27 @@ PHP_METHOD(QPackContext, encode)
 			RETURN_THROWS();
 		}
 
-		if (Z_TYPE_P(name_zv) != IS_STRING) convert_to_string(name_zv);
-		if (Z_TYPE_P(value_zv) != IS_STRING) convert_to_string(value_zv);
+		zend_string *name_str = zval_get_string(name_zv);
+		zend_string *value_str = zval_get_string(value_zv);
 
-		const char *name = Z_STRVAL_P(name_zv);
-		size_t name_len = Z_STRLEN_P(name_zv);
-		const char *value = Z_STRVAL_P(value_zv);
-		size_t value_len = Z_STRLEN_P(value_zv);
+		const char *name = ZSTR_VAL(name_str);
+		size_t name_len = ZSTR_LEN(name_str);
+		const char *value = ZSTR_VAL(value_str);
+		size_t value_len = ZSTR_LEN(value_str);
 
 		int sensitive = qpack_is_sensitive(name, name_len);
 
-		/* Ensure field buffer has space */
-		size_t needed = name_len + value_len + 32;
+		/* Ensure field buffer has space (with overflow check) */
+		size_t needed = name_len + value_len;
+		if (needed < name_len || needed + 32 < needed) {
+			zend_string_release(name_str);
+			zend_string_release(value_str);
+			efree(buf);
+			efree(field_buf);
+			zend_throw_exception(spl_ce_RuntimeException, "Header too large", 0);
+			RETURN_THROWS();
+		}
+		needed += 32;
 		if (field_pos + needed > field_bufsize) {
 			field_bufsize = (field_pos + needed) * 2;
 			field_buf = erealloc(field_buf, field_bufsize);
@@ -840,6 +850,9 @@ PHP_METHOD(QPackContext, encode)
 				(const uint8_t *)value, value_len, 1);
 			field_pos += n;
 		}
+
+		zend_string_release(name_str);
+		zend_string_release(value_str);
 	} ZEND_HASH_FOREACH_END();
 
 	/*
@@ -948,7 +961,8 @@ PHP_METHOD(QPackContext, decode)
 		uint64_t full_range = 2 * max_entries;
 		uint64_t total_decoded = ctx->dec_table.insert_count;
 
-		if (encoded_ric - 1 > total_decoded) {
+		/* RFC 9204 Section 4.5.1.1: EncodedInsertCount > FullRange is an error */
+		if (encoded_ric > full_range) {
 			RETURN_NULL();
 		}
 
@@ -1274,18 +1288,28 @@ PHP_METHOD(QPackContext, processEncoderStream)
 		} else {
 			/*
 			 * Duplicate: RFC 9204 Section 4.3.5
-			 * 000 index
+			 * 000 index (relative, 5-bit prefix)
+			 * Convert relative index to absolute (RFC 9204 Section 3.2.6)
 			 */
 			uint64_t index;
 			if (qpack_decode_integer(buf, data_len, &pos, 5, &index) < 0) {
 				RETURN_FALSE;
 			}
 
-			qpack_dyn_entry *entry = qpack_dyn_table_get(&ctx->dec_table, index);
+			if (index >= ctx->dec_table.insert_count) RETURN_FALSE;
+			uint64_t abs_idx = ctx->dec_table.insert_count - index - 1;
+			qpack_dyn_entry *entry = qpack_dyn_table_get(&ctx->dec_table, abs_idx);
 			if (!entry) RETURN_FALSE;
 
-			qpack_dyn_table_insert(&ctx->dec_table,
-				entry->name, entry->value);
+			/*
+			 * Copy name/value BEFORE insert to avoid use-after-free:
+			 * insert may evict the entry we just looked up.
+			 */
+			zend_string *dup_name = zend_string_copy(entry->name);
+			zend_string *dup_value = zend_string_copy(entry->value);
+			qpack_dyn_table_insert(&ctx->dec_table, dup_name, dup_value);
+			zend_string_release(dup_name);
+			zend_string_release(dup_value);
 		}
 	}
 
