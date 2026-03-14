@@ -4,7 +4,7 @@
 extern zend_module_entry qpack_module_entry;
 #define phpext_qpack_ptr &qpack_module_entry
 
-#define PHP_QPACK_VERSION "1.0.0"
+#define PHP_QPACK_VERSION "1.0.1"
 
 #ifdef PHP_WIN32
 # define PHP_QPACK_API __declspec(dllexport)
